@@ -47,7 +47,10 @@ import kotlin.math.abs
 import android.media.AudioManager
 import android.media.AudioFocusRequest
 import android.media.MediaPlayer
-
+import android.os.VibrationAttributes
+import android.os.VibrationAttributes.FLAG_BYPASS_INTERRUPTION_POLICY
+import android.os.VibratorManager
+import android.telephony.TelephonyManager
 class ForegroundService : Service() {
 
     private var token : String = ""
@@ -67,6 +70,10 @@ class ForegroundService : Service() {
     private var isTimeoutCancelled = false
     private val mainHandler = Handler(Looper.getMainLooper())
     var timeoutListener: CallTimeoutListener? = null
+    private var vibrator: Vibrator? = null
+    private var isVibrating = false
+    private val vibrationHandler = Handler(Looper.getMainLooper())
+    private var vibrationRunnable: Runnable? = null
 
     private val notificationManager by lazy {
         getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -77,10 +84,13 @@ class ForegroundService : Service() {
     private var ringtoneUri : Uri ? = null
     private var android12RingtonePlayer: MediaPlayer? = null
 
+    private var audioFocusRequest: AudioFocusRequest? = null
+    private var audioManager: AudioManager? = null
+
     companion object {
         const val DEFAULT_NOTIFICATION_ID = 3456
         const val DEFAULT_CHANNEL_ID = "livekit_example_foreground"
-        const val INCOMING_CALL_CHANNEL_ID = "incoming_call_channel_v16"
+        const val INCOMING_CALL_CHANNEL_ID = "incoming_call_channel_v15"
         const val ACTION_ACCEPT_CALL = "com.example.livekitprepsapp.ACCEPT_CALL"
         const val ACTION_REJECT_CALL = "com.example.livekitprepsapp.REJECT_CALL"
         const val ACTION_HANG_UP = "com.example.livekitperpsapp.HANG_UP"
@@ -89,7 +99,6 @@ class ForegroundService : Service() {
         private val e2eekey = Endpoints.LiveKitKeys.LIVEKIT_ROOM_KEY
 
         var ringtone: Ringtone? = null
-        var vibrator: Vibrator? = null
         const val TAG = "ForegroundService"
     }
 
@@ -139,7 +148,7 @@ class ForegroundService : Service() {
             when (intent?.action) {
                 "com.elysion.baatein.CANCEL_TIMEOUT" -> {
                     cancelIncomingCallTimeout()
-                    stopRingtone()
+                    stopAndroid12Ringtone()
                     stopVibration()
                     stopSelfWithLogging("2")
                     return START_NOT_STICKY
@@ -303,7 +312,6 @@ class ForegroundService : Service() {
     private fun handleCallAccept() {
         Log.d(TAG, "Handling call accept")
 
-        stopRingtone()
         stopVibration()
         stopAndroid12Ringtone()
         cancelIncomingCallTimeout()
@@ -407,7 +415,6 @@ class ForegroundService : Service() {
     private fun handleCallReject() {
         Log.d(TAG, "Handling call reject")
 
-        stopRingtone()
         stopVibration()
         stopAndroid12Ringtone()
         cancelIncomingCallTimeout()
@@ -427,7 +434,7 @@ class ForegroundService : Service() {
     private fun handleCallHangUp() {
         Log.d(TAG, "Handling call hang up")
 
-        stopRingtone()
+        stopAndroid12Ringtone()
         stopVibration()
         cancelIncomingCallTimeout()
 
@@ -438,25 +445,28 @@ class ForegroundService : Service() {
 
     private fun cancelOngoingCallNotifications() {
         try {
-            val notificationManager =
-                getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            stopVibration() // Add this
+            stopAndroid12Ringtone()
+
+            val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             notificationManager.cancel(INCOMING_CALL_NOTIFICATION_ID)
             notificationManager.cancel(DEFAULT_NOTIFICATION_ID)
             notificationManager.cancelAll()
         } catch (e: Exception) {
-            Log.e(TAG, "NOTIDFICATION CANCELING ERROR: ${e.message}")
+            Log.e(TAG, "Error canceling notifications: ${e.message}")
         }
 
-        stopRingtone()
-        stopVibration()
-        stopAndroid12Ringtone()
         releaseLocks()
         stopSelfWithLogging("7")
     }
 
     private fun dismissIncomingCall(reason: String) {
-        if(isTimeoutCancelled ) return
+        if(isTimeoutCancelled) return
         Log.d(TAG, "Call dismissed due to: $reason")
+
+        stopVibration() // Add this
+        stopAndroid12Ringtone()
+
         SocketManager.emitCallEnded(this, channelId, uuid, reason, true)
         cancelOngoingCallNotifications()
         stopSelfWithLogging("1")
@@ -584,7 +594,6 @@ class ForegroundService : Service() {
 
         wakeUpScreen()
         handleRingtoneForVersion()
-        startVibration()
         setupCallTimeout()
     }
 
@@ -712,7 +721,6 @@ class ForegroundService : Service() {
         notificationManager.notify(INCOMING_CALL_NOTIFICATION_ID, notification)
 
         wakeUpScreen()
-        startVibration()
         handleRingtoneForVersion()
         setupCallTimeout()
     }
@@ -893,76 +901,107 @@ class ForegroundService : Service() {
     }
 
     private fun handleRingtoneForVersion() {
-        playManualRingtoneForAndroid12andBelow()
-//        when {
-//            Build.VERSION.SDK_INT == Build.VERSION_CODES.S -> {
-//                // Android 12 - use manual ringtone
-//                Log.d(TAG, "Starting manual ringtone for Android 12")
-//                playManualRingtoneForAndroid12andBelow()
-//            }
-//            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU -> {
-//                // Android 13+ - channel sound works fine
-//                Log.d(TAG, "Using channel sound for Android 13+")
-//                // Channel sound will handle it automatically
-//            }
-//            else -> {
-//                // Pre-Android 12 - channel sound works
-//                Log.d(TAG, "Using channel sound for pre-Android 12")
-//                playManualRingtoneForAndroid12andBelow()
-//            }
-//        }
+        playLoopingRingtone()
+
     }
 
-    private fun playManualRingtoneForAndroid12andBelow() {
+
+    private fun playLoopingRingtone() {
         try {
-            val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            stopAndroid12Ringtone()
 
-            // Request audio focus specifically for Android 12
-            val result = audioManager.requestAudioFocus(
-                { focusChange ->
-                    when (focusChange) {
-                        AudioManager.AUDIOFOCUS_LOSS -> stopAndroid12Ringtone()
-                        AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
-                            // Keep playing for incoming calls
-                        }
-                    }
-                },
-                AudioManager.STREAM_RING,
-                AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
-            )
+            audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
-            if (result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
-                android12RingtonePlayer = MediaPlayer().apply {
-                    setAudioAttributes(
-                        AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
-                            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                            .setLegacyStreamType(AudioManager.STREAM_RING)
-                            .setFlags(AudioAttributes.FLAG_AUDIBILITY_ENFORCED)
-                            .build()
-                    )
-
-                    try {
-                        setDataSource(this@ForegroundService, ringtoneUri!!)
-                        isLooping = true
-                        setOnPreparedListener { mp ->
-                            mp.start()
-                            Log.d(TAG, "Android 12 manual ringtone started")
-                        }
-                        setOnErrorListener { mp, what, extra ->
-                            Log.e(TAG, "Android 12 ringtone error: what=$what, extra=$extra")
-                            false
-                        }
-                        prepareAsync()
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Failed to prepare Android 12 ringtone: ${e.message}")
-                        release()
-                        android12RingtonePlayer = null
+            // Check for active phone calls
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                if (checkSelfPermission(android.Manifest.permission.READ_PHONE_STATE)
+                    == PackageManager.PERMISSION_GRANTED) {
+                    val telephonyManager = getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
+                    if (telephonyManager.callState != TelephonyManager.CALL_STATE_IDLE) {
+                        Log.w(TAG, "Phone call in progress - skipping ringtone")
+                        return
                     }
                 }
             }
+
+            // START VIBRATION BEFORE requesting audio focus
+            startVibration()
+
+            val audioAttributes = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                .build()
+
+            // CRITICAL: Modified audio focus listener to NOT stop vibration
+            val focusChangeListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
+                when (focusChange) {
+                    AudioManager.AUDIOFOCUS_LOSS -> {
+                        Log.d(TAG, "Audio focus lost - stopping ringtone but KEEPING vibration")
+                        // Only stop ringtone, NOT vibration
+                        android12RingtonePlayer?.let { player ->
+                            if (player.isPlaying) {
+                                player.stop()
+                            }
+                            player.release()
+                        }
+                        android12RingtonePlayer = null
+                        // Note: We do NOT call stopVibration() here
+                    }
+                    AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+                        Log.d(TAG, "Temporary audio focus loss - pausing ringtone")
+                        android12RingtonePlayer?.pause()
+                    }
+                    AudioManager.AUDIOFOCUS_GAIN -> {
+                        Log.d(TAG, "Audio focus regained - resuming ringtone")
+                        android12RingtonePlayer?.takeIf { !it.isPlaying }?.start()
+                    }
+                }
+            }
+
+            val result: Int? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                audioFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
+                    .setAudioAttributes(audioAttributes)
+                    .setOnAudioFocusChangeListener(focusChangeListener)
+                    .setWillPauseWhenDucked(false)
+                    .build()
+                audioManager?.requestAudioFocus(audioFocusRequest!!)
+            } else {
+                @Suppress("DEPRECATION")
+                audioManager?.requestAudioFocus(
+                    focusChangeListener,
+                    AudioManager.STREAM_RING,
+                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
+                )
+            }
+
+            if (result != AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+                Log.w(TAG, "Audio focus denied - vibration will continue")
+            }
+
+            // Setup MediaPlayer for ringtone
+            val uri = ringtoneUri ?: Uri.parse("android.resource://${packageName}/${R.raw.call_ringtone}")
+
+            android12RingtonePlayer = MediaPlayer().apply {
+                setAudioAttributes(audioAttributes)
+                setDataSource(this@ForegroundService, uri)
+                isLooping = true
+                setOnPreparedListener { mp -> mp.start() }
+                setOnErrorListener { _, what, extra ->
+                    Log.e(TAG, "MediaPlayer error: what=$what, extra=$extra")
+                    // Only stop ringtone on error, keep vibration
+                    stopAndroid12Ringtone()
+                    false
+                }
+                prepareAsync()
+            }
+
+            Log.d(TAG, "Ringtone setup complete")
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to start Android 12 ringtone: ${e.message}")
+            Log.e(TAG, "Failed to start ringtone", e)
+            // Ensure vibration continues even if ringtone fails
+            if (!isVibrating) {
+                startVibration()
+            }
         }
     }
 
@@ -976,97 +1015,41 @@ class ForegroundService : Service() {
             }
             android12RingtonePlayer = null
 
-            val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-            audioManager.abandonAudioFocus(null)
+            abandonAudioFocus()
+
+            // NOTE: Do NOT call stopVibration() here
+            // Vibration is managed separately
+
+            Log.d(TAG, "Ringtone stopped (vibration continues)")
         } catch (e: Exception) {
-            Log.e(TAG, "Error stopping Android 12 ringtone: ${e.message}")
+            Log.e(TAG, "Error stopping ringtone", e)
         }
     }
-
-    // IMPROVED: Better ringtone handling with proper audio focus
-    private fun playRingtone() {
+    private fun abandonAudioFocus() {
         try {
-            // ADDED: Request audio focus for ringtone
-            val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-            val result = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                val audioAttributes = AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                    .build()
+            val am = audioManager ?: getSystemService(Context.AUDIO_SERVICE) as? AudioManager
 
-                val focusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
-                    .setAudioAttributes(audioAttributes)
-                    .setAcceptsDelayedFocusGain(false)
-                    .setOnAudioFocusChangeListener { /* Handle focus changes */ }
-                    .build()
-
-                audioManager.requestAudioFocus(focusRequest)
-            } else {
-                audioManager.requestAudioFocus(
-                    null,
-                    AudioManager.STREAM_RING,
-                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
-                )
-            }
-
-            if (result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
-                val ringtoneUri = Uri.parse("android.resource://${packageName}/${R.raw.call_ringtone}")
-                ringtone = RingtoneManager.getRingtone(applicationContext, ringtoneUri)
-
-                ringtone?.audioAttributes = AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                    .setLegacyStreamType(AudioManager.STREAM_RING) // ADDED: Proper stream type
-                    .build()
-
-                ringtone?.isLooping = true // ADDED: Loop ringtone
-                ringtone?.play() ?: Log.w(TAG, "Ringtone is null, cannot play")
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to play ringtone: ${e.message}", e)
-        }
-    }
-
-    private fun stopRingtone() {
-        try {
-            ringtone?.let {
-                if (it.isPlaying) {
-                    it.stop()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                audioFocusRequest?.let { request ->
+                    am?.abandonAudioFocusRequest(request)
+                    Log.d(TAG, "Audio focus abandoned (API 26+)")
                 }
+            } else {
+                // For pre-O, you need to pass the same listener you used when requesting
+                // Since we don't store it, just pass null (this is acceptable)
+                @Suppress("DEPRECATION")
+                am?.abandonAudioFocus(null)
+                Log.d(TAG, "Audio focus abandoned (legacy)")
             }
-            ringtone = null
 
-            // ADDED: Release audio focus
-            val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-            audioManager.abandonAudioFocus(null)
+            audioFocusRequest = null
         } catch (e: Exception) {
-            Log.e(TAG, "Error stopping ringtone: ${e.message}")
+            Log.e(TAG, "Error abandoning audio focus", e)
         }
     }
 
 
-//    private fun startVibration() {
-//        try {
-//            vibrator = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
-//
-//            // IMPROVED: More noticeable vibration pattern
-//            val pattern = longArrayOf(0, 1000, 500, 1000, 500, 1000)
-//
-//            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-//                val effect = VibrationEffect.createWaveform(pattern, 0) // CHANGED: Loop vibration
-//                vibrator?.vibrate(effect)
-//            } else {
-//                vibrator?.vibrate(pattern, 0) // CHANGED: Loop vibration
-//            }
-//        } catch (e: Exception) {
-//            Log.e(TAG, "Failed to start vibration: ${e.message}")
-//        }
-//    }
-//
-//    private fun stopVibration() {
-//        vibrator?.cancel()
-//        vibrator = null
-//    }
+
 
     private fun wakeUpScreen() {
         try {
@@ -1095,7 +1078,7 @@ class ForegroundService : Service() {
         timeoutRunnable = Runnable {
             dismissIncomingCall("Call not answered")
             timeoutListener?.onCallTimeout()
-
+ 
         }
         timeoutRunnable?.let {
             timeoutHandler?.postDelayed(it, 50000)
@@ -1112,27 +1095,15 @@ class ForegroundService : Service() {
     }
 
     override fun onDestroy() {
-
         Log.d(TAG, "=== onDestroy() called ===")
-//        Log.d(TAG, "Service uptime: ${System.currentTimeMillis() - serviceStartTime}ms")
 
-        // Print full stack trace to see what called onDestroy
-        val stackTrace = Thread.currentThread().stackTrace
-        stackTrace.forEachIndexed { index, element ->
-            Log.d(TAG, "Stack[$index]: ${element.className}.${element.methodName}:${element.lineNumber}")
-        }
+        stopVibration() // Ensure vibration stops
+        stopAndroid12Ringtone()
 
-        Log.d(TAG, "Current notification ID: $INCOMING_CALL_NOTIFICATION_ID")
-        Log.d(TAG, "Has shown notification: $hasShownIncomingNotification")
-        Log.d(TAG, "Channel ID: $channelId")
-
-
-        Log.d(TAG, "onDestroy called")
         mainHandler.removeCallbacksAndMessages(null)
+        vibrationHandler.removeCallbacksAndMessages(null)
         cancelIncomingCallTimeout()
-        stopRingtone()
-//        stopVibration()
-//        releaseLocks()
+
         super.onDestroy()
     }
 
@@ -1169,86 +1140,117 @@ class ForegroundService : Service() {
 
     private fun startVibration() {
         try {
-            return
-            Log.d(TAG, "Starting vibration...")
+            Log.d(TAG, "=== Starting Continuous Vibration ===")
 
-            // Check prerequisites
-            if (!checkVibrationPermissions()) {
-                Log.e(TAG, "Vibration permission not granted")
+            // Stop any existing vibration
+            stopVibration()
+
+            // Get vibrator based on Android version
+            vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val vibratorManager = getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager
+                vibratorManager?.defaultVibrator
+            } else {
+                @Suppress("DEPRECATION")
+                getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+            }
+
+            if (vibrator == null || !vibrator!!.hasVibrator()) {
+                Log.e(TAG, "Vibrator not available")
                 return
             }
 
-            if (!checkDeviceVibrationCapability()) {
-                Log.e(TAG, "Device doesn't support vibration")
-                return
-            }
-
-            if (!checkDNDSettings()) {
-                Log.w(TAG, "Do Not Disturb is active - vibration may be blocked")
-            }
-
-            vibrator = getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
-
-            if (vibrator == null) {
-                Log.e(TAG, "Vibrator service is null")
-                return
-            }
-
-            // Check if device supports vibration
-            if (!vibrator!!.hasVibrator()) {
-                Log.e(TAG, "Device does not have vibrator capability")
-                return
-            }
-
-            // IMPROVED: Better vibration pattern and amplitude
-            val pattern = longArrayOf(0, 1000, 500, 1000, 500, 1000) // More noticeable pattern
+            // Pattern: vibrate 1s, pause 0.5s, repeat
+            val pattern = longArrayOf(0, 1000, 500)
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                Log.d(TAG, "Using VibrationEffect for Android O+")
+                val effect = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+                    vibrator!!.hasAmplitudeControl()) {
+                    // With amplitude control
+                    val amplitudes = intArrayOf(0, 255, 0)
+                    VibrationEffect.createWaveform(pattern, amplitudes, 0) // 0 = repeat from start
+                } else {
+                    // Without amplitude control
+                    VibrationEffect.createWaveform(pattern, 0) // 0 = repeat
+                }
 
-                // Try with amplitude control first
-                try {
-                    val amplitudes = intArrayOf(0, 255, 0, 255, 0, 255) // Max amplitude
-                    val effect = VibrationEffect.createWaveform(pattern, amplitudes, 0) // 0 = repeat
-                    vibrator!!.vibrate(effect)
-                    Log.d(TAG, "Vibration started with amplitude control")
-                } catch (e: Exception) {
-                    Log.w(TAG, "Amplitude control failed, trying without: ${e.message}")
-                    // Fallback without amplitude
-                    val effect = VibrationEffect.createWaveform(pattern, 0)
-                    vibrator!!.vibrate(effect)
-                    Log.d(TAG, "Vibration started without amplitude control")
+                // Use appropriate attributes based on Android version
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    val attributes = VibrationAttributes.Builder()
+                        .setUsage(VibrationAttributes.USAGE_RINGTONE)
+                        .setFlags(FLAG_BYPASS_INTERRUPTION_POLICY)
+                        .build()
+                    vibrator!!.vibrate(effect, attributes)
+                } else {
+                    val audioAttributes = AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                        .build()
+                    vibrator!!.vibrate(effect, audioAttributes)
                 }
             } else {
-                Log.d(TAG, "Using legacy vibrate for older Android")
-                vibrator!!.vibrate(pattern, 0) // 0 = repeat
-                Log.d(TAG, "Legacy vibration started")
+                @Suppress("DEPRECATION")
+                vibrator!!.vibrate(pattern, 0) // 0 = repeat indefinitely
             }
 
+            isVibrating = true
+            Log.d(TAG, "Vibration started successfully")
 
-        } catch (e: SecurityException) {
-            Log.e(TAG, "SecurityException starting vibration: ${e.message}")
+            // Safety mechanism: Restart vibration if it stops unexpectedly
+            startVibrationMonitor()
+
         } catch (e: Exception) {
-            Log.e(TAG, "Exception starting vibration: ${e.message}", e)
+            Log.e(TAG, "Failed to start vibration: ${e.message}", e)
         }
     }
+
+    private fun startVibrationMonitor() {
+        vibrationRunnable?.let { vibrationHandler.removeCallbacks(it) }
+
+        vibrationRunnable = object : Runnable {
+            override fun run() {
+                if (isVibrating && vibrator != null) {
+                    // Check if we're still supposed to be vibrating
+                    // Restart if needed (defensive programming)
+                    try {
+                        // Re-trigger vibration pattern to ensure continuity
+                        val pattern = longArrayOf(0, 1000, 500)
+
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            val effect = VibrationEffect.createWaveform(pattern, 0)
+                            vibrator!!.vibrate(effect)
+                        } else {
+                            @Suppress("DEPRECATION")
+                            vibrator!!.vibrate(pattern, 0)
+                        }
+
+                        Log.d(TAG, "Vibration monitor: Re-triggered vibration")
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Vibration monitor error: ${e.message}")
+                    }
+
+                    // Check again in 10 seconds
+                    vibrationHandler.postDelayed(this, 10000)
+                }
+            }
+        }
+    }
+
 
     // IMPROVED: Better vibration stopping with verification
     private fun stopVibration() {
         try {
-            return
-            Log.d(TAG, "stopVibration() called from: ${Thread.currentThread().stackTrace[3].methodName}")
-            Log.d(TAG, "Stack trace: ${Thread.currentThread().stackTrace.contentToString()}")
+            Log.d(TAG, "Stopping vibration")
 
-            Log.d(TAG, "Stopping vibration...")
-            vibrator?.let { vib ->
-                vib.cancel()
-                Log.d(TAG, "Vibration cancelled")
+            // Cancel monitoring
+            vibrationRunnable?.let { vibrationHandler.removeCallbacks(it) }
+            vibrationRunnable = null
 
-
-            } ?: Log.w(TAG, "Vibrator was null when trying to stop")
-
+            // Cancel vibration
+            vibrator?.cancel()
             vibrator = null
+            isVibrating = false
+
+            Log.d(TAG, "Vibration stopped")
         } catch (e: Exception) {
             Log.e(TAG, "Error stopping vibration: ${e.message}")
         }
